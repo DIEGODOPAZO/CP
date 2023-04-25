@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <openssl/evp.h>
 
+
 #include "options.h"
 #include "queue.h"
 
@@ -24,6 +25,28 @@ struct file_md5 {
     unsigned int hash_size;
 };
 
+struct dirThreadData{
+    char * dir;
+    queue q;
+};
+
+struct computeHashData{
+    queue in_q;
+    queue out_q;
+};
+
+struct writeFileData{
+    int dirname_len;
+    queue out_q;
+    char *filename;
+};
+
+
+struct readHashData{
+    char *dir;
+    char *file;
+    queue q;
+};
 
 void get_entries(char *dir, queue q);
 
@@ -63,6 +86,7 @@ void read_hash_file(char *file, char *dir, queue q) {
 
         q_insert(q, md5);
     }
+    noMoreElements(q);
 
     fclose(fp);
 }
@@ -76,6 +100,7 @@ void sum_file(struct file_md5 *md5) {
 
     if((fp = fopen(md5->file, "r")) == NULL) {
         printf("Could not open %s\n", md5->file);
+        md5->file = NULL;
         return;
     }
 
@@ -85,7 +110,7 @@ void sum_file(struct file_md5 *md5) {
     mdctx = EVP_MD_CTX_create();
     EVP_DigestInit_ex(mdctx, md, NULL);
 
-    while((nbytes = fread(buf, BLOCK_SIZE, 1, fp)) >0)
+    while((nbytes = fread(buf, 1, BLOCK_SIZE, fp)) >0)
         EVP_DigestUpdate(mdctx, buf, nbytes);
 
     md5->hash = malloc(EVP_MAX_MD_SIZE);
@@ -148,18 +173,44 @@ void get_entries(char *dir, queue q) {
 }
 
 
-void check(struct options opt) {
-    queue in_q;
+
+void *get_entries_wrapper(void *args){
+
+    struct dirThreadData * dirData = (struct dirThreadData *) args;
+    char *dir = dirData->dir;
+    queue q = dirData->q;
+
+    get_entries(dir, q);
+
+    noMoreElements(q);
+
+    return NULL;
+}
+
+
+void *read_hashes_wraper(void * args){
+    struct readHashData * data = (struct readHashData * ) args;
+
+    read_hash_file(data->file, data->dir, data->q);
+
+    return NULL;
+}
+
+void *comparar_hashes(void * args){
+    queue q = (queue) args;
     struct file_md5 *md5_in, md5_file;
 
-    in_q  = q_create(opt.queue_size);
 
-    read_hash_file(opt.file, opt.dir, in_q);
-
-    while((md5_in = q_remove(in_q))) {
+    while((md5_in = q_remove(q))) {
         md5_file.file = md5_in->file;
 
         sum_file(&md5_file);
+        if(md5_file.file == NULL){
+            free(md5_in->file);
+            free(md5_in->hash);
+            free(md5_in);
+            continue;
+        }
 
         if(memcmp(md5_file.hash, md5_in->hash, md5_file.hash_size)!=0) {
             printf("File %s doesn't match.\nFound:    ", md5_file.file);
@@ -176,21 +227,57 @@ void check(struct options opt) {
         free(md5_in);
     }
 
+    return NULL;
+
+}
+
+void check(struct options opt) {
+    queue in_q;
+    pthread_t readHashes;
+    pthread_t compareHashes[opt.num_threads];
+    struct readHashData data;
+
+    in_q  = q_create(opt.queue_size);
+
+    data.q = in_q;
+    data.file = opt.file;
+    data.dir = opt.dir;
+
+    if(pthread_create(&readHashes, NULL, read_hashes_wraper, (void *) &data) != 0){
+        printf("ERROR while creating the thread\n");
+        return;
+    }
+
+    for(int i = 0; i < opt.num_threads; i++){
+
+        if(pthread_create(&compareHashes[i], NULL, comparar_hashes, (void *) in_q) != 0){
+            printf("ERROR while creating the thread\n");
+            return;
+        }
+
+    }
+
+
+
+    pthread_join(readHashes, NULL);
+
+    for(int i = 0; i < opt.num_threads; i++){
+
+        pthread_join(compareHashes[i], NULL);
+
+    }
+
     q_destroy(in_q);
 }
 
+void * computeHashes(void *args){
 
-void sum(struct options opt) {
-    queue in_q, out_q;
+    struct computeHashData * hashData = (struct computeHashData *) args;
     char *ent;
-    FILE *out;
     struct file_md5 *md5;
-    int dirname_len;
 
-    in_q  = q_create(opt.queue_size);
-    out_q = q_create(opt.queue_size);
-
-    get_entries(opt.dir, in_q);
+    queue in_q = hashData->in_q;
+    queue out_q = hashData->out_q;
 
     while((ent = q_remove(in_q)) != NULL) {
         md5 = malloc(sizeof(struct file_md5));
@@ -199,14 +286,28 @@ void sum(struct options opt) {
         sum_file(md5);
 
         q_insert(out_q, md5);
+
     }
 
-    if((out = fopen(opt.file, "w")) == NULL) {
+    return NULL;
+
+}
+
+
+
+void * writeFile(void *args){
+    struct writeFileData * writeData = (struct writeFileData *) args;
+
+    int dirname_len = writeData->dirname_len;
+    queue out_q = writeData->out_q;
+    char *filename = writeData->filename;
+    struct file_md5 *md5;
+    FILE *out;
+
+    if((out = fopen(filename, "w")) == NULL) {
         printf("Could not open output file\n");
         exit(0);
     }
-
-    dirname_len = strlen(opt.dir) + 1; // length of dir + /
 
     while((md5 = q_remove(out_q)) != NULL) {
         fprintf(out, "%s: ", md5->file + dirname_len);
@@ -221,6 +322,73 @@ void sum(struct options opt) {
     }
 
     fclose(out);
+
+    return NULL;
+}
+
+
+void sum(struct options opt) {
+    queue in_q, out_q;
+
+    struct dirThreadData dirData;
+    struct computeHashData hashData;
+    struct writeFileData writeData;
+    pthread_t dirThread;
+    pthread_t computeHashThread[opt.num_threads];
+    pthread_t writeFileThread;
+
+    in_q  = q_create(opt.queue_size);
+    out_q = q_create(opt.queue_size);
+
+
+    dirData.q = in_q;
+    dirData.dir = opt.dir;
+
+    hashData.in_q = in_q;
+    hashData.out_q = out_q;
+
+    writeData.dirname_len = strlen(opt.dir) + 1; // length of dir + /
+    writeData.filename = opt.file;
+    writeData.out_q = out_q;
+
+    if(pthread_create(&dirThread, NULL, get_entries_wrapper, (void *) &dirData) != 0){
+        printf("ERROR while creating the thread\n");
+        return;
+    }
+
+    for(int i = 0; i < opt.num_threads; i++){
+
+        if(pthread_create(&computeHashThread[i], NULL, computeHashes, (void *) &hashData) != 0){
+            printf("ERROR while creating the thread\n");
+            return;
+        }
+    }
+
+    if(pthread_create(&writeFileThread, NULL, writeFile, (void *) &writeData) != 0){
+        printf("ERROR while creating the thread\n");
+        return;
+    }
+
+
+
+    pthread_join(dirThread, NULL);
+
+
+    for(int i = 0; i < opt.num_threads; i++){
+        pthread_join(computeHashThread[i], NULL);
+        if(i == opt.num_threads - 1){
+            noMoreElements(out_q);  //ask if here is where it has to be the noMoreElements(out)
+        }
+
+    }
+
+    pthread_join(writeFileThread, NULL);
+
+
+
+
+
+
     q_destroy(in_q);
     q_destroy(out_q);
 }
